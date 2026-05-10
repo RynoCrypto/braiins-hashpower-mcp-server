@@ -1,10 +1,12 @@
 # SPEC.md — Braiins Hashpower MCP Server
 
-**Version:** 0.1  
-**Transport:** SSE (Server-Sent Events)  
-**Framework:** FastMCP (`mcp[server]`) + LangChain MCP Adapters  
+**Version:** 0.2  
+**Transport:** SSE (primary) + Streamable HTTP (v0.2)  
+**Framework:** FastMCP (`mcp[server]>=1.9.1`) + LangChain MCP Adapters  
 **API Target:** [Braiins Hashpower Network](https://hashpower.braiins.com/api/)  
-**Language:** Python 3.11+
+**Language:** Python 3.11+  
+**Deployment Model:** Multi-tenant, horizontally scalable, stateless nodes  
+**Architecture Reference:** See ARCHITECTURE.md for full system design
 
 ---
 
@@ -16,27 +18,30 @@ This document specifies the design of an MCP server that wraps the Braiins Hashp
 
 - Provide a safe, agent-friendly interface for reading Braiins spot-market data and managing orders.
 - Enforce server-side unit normalization using `/spot/settings` metadata before any order is submitted.
+- Support multi-tenant operation with full per-tenant credential and configuration isolation.
+- Scale horizontally with stateless compute nodes; all shared state in Redis and PostgreSQL.
 - Guarantee credentials never leave the server process.
 - Default to `dry_run=true` on all write tools until explicitly disabled by the operator.
 - Be compatible with `MultiServerMCPClient` from `langchain-mcp-adapters` over SSE.
 
-### Out of Scope (v0.1)
+### Out of Scope (v0.2)
 
 - Futures or non-spot market types.
 - Webhook or push-based order status notifications.
-- Multi-account / sub-account management.
 - Portfolio analytics or charting.
 
 ---
 
 ## 2. Transport: SSE
 
-The server uses SSE (Server-Sent Events) transport, which is one of the two HTTP-based MCP transports supported by `langchain-mcp-adapters` (alongside `streamable_http`). SSE is chosen because:
+The server uses SSE (Server-Sent Events) as its primary transport. SSE is one of the two HTTP-based MCP transports supported by `langchain-mcp-adapters` (alongside `streamable_http`). SSE is chosen because:
 
 - It is widely supported across MCP clients including Claude Desktop, Cursor, and LangGraph agents.
 - The `langchain-mcp-adapters` `MultiServerMCPClient` supports it natively with `"transport": "sse"`.
-- Runtime headers (e.g., Authorization, trace IDs) can be injected per-connection.
+- Runtime headers (e.g., `Authorization`, trace IDs) can be injected per-connection — a requirement for multi-tenant auth.
 - It is stateless-friendly for horizontally scaled deployments.
+
+`streamable_http` transport will be added as a secondary option in v0.2. The SSE endpoint is the v0.2 stable interface.
 
 ### Server Endpoint
 
@@ -45,6 +50,14 @@ GET http://{host}:{port}/sse
 ```
 
 Default: `http://0.0.0.0:8765/sse`
+
+Health and readiness endpoints (required for load balancer routing):
+
+```
+GET /health    → liveness check
+GET /ready     → readiness check (Redis + PostgreSQL reachable)
+GET /metrics   → Prometheus metrics scrape
+```
 
 ### Client Configuration (`langchain-mcp-adapters`)
 
@@ -57,6 +70,9 @@ client = MultiServerMCPClient(
             "transport": "sse",
             "url": "http://localhost:8765/sse",
             "headers": {
+                # Multi-tenant: per-tenant bearer token
+                "Authorization": "Bearer <tenant_api_key>",
+                # Optional: per-request trace ID for distributed tracing
                 "X-Trace-Id": "optional-trace-header"
             }
         }
@@ -65,11 +81,34 @@ client = MultiServerMCPClient(
 tools = await client.get_tools()
 ```
 
-> Only `sse` and `streamable_http` transports support runtime headers in `langchain-mcp-adapters`. Headers are passed with every HTTP request to the MCP server.
+> Only `sse` and `streamable_http` transports support runtime headers in `langchain-mcp-adapters`. The `Authorization` header is required for multi-tenant deployments; it is validated by the API gateway before reaching MCP nodes.
 
 ---
 
-## 3. Server Implementation
+## 3. Multi-Tenancy
+
+### 3.1 Tenant Identity and Isolation
+
+Each tenant is identified by a bearer token resolved to a `tenant_id` (UUID) by the API gateway auth service. MCP nodes receive `X-Tenant-Id` on every validated request. See ARCHITECTURE.md §3 for the full tenant data model.
+
+Tenant-scoped behavior per request:
+
+| Concern | Mechanism |
+|---------|-----------|
+| API credentials | Per-tenant Braiins key/secret, decrypted at request time |
+| Settings cache | Redis key: `tenant:{id}:spot:settings` |
+| Rate limits | Redis counter: `ratelimit:{id}:{tool}:{window}` |
+| Spend caps | Per-tenant `max_order_usd` from tenant config |
+| Audit log | Every tool call logged with `tenant_id` in PostgreSQL |
+| Idempotency | Redis key: `idempotency:{id}:{client_order_id}`, 24h TTL |
+
+### 3.2 Single-Tenant Mode (development)
+
+Set `MCP_SINGLE_TENANT_MODE=true` and `SINGLE_TENANT_API_KEY=<key>` to bypass multi-tenant auth. This restores the single-process v0.1 behavior suitable for local development and direct Cursor/Claude Desktop integration.
+
+---
+
+## 4. Server Implementation
 
 ### Framework
 
@@ -78,11 +117,12 @@ The server is implemented using **FastMCP** from the `mcp` Python SDK:
 ```python
 # braiins_hashpower_mcp/server.py
 from mcp.server.fastmcp import FastMCP
+from .middleware import TenantContextMiddleware
 
 mcp = FastMCP("BraiinsHashpower")
 
 # Tools, resources, and prompts are registered via decorators
-# (see sections 4, 5, 6)
+# (see sections 5, 6, 7)
 
 if __name__ == "__main__":
     mcp.run(transport="sse")
@@ -91,17 +131,34 @@ if __name__ == "__main__":
 FastMCP handles:
 - MCP protocol handshake and capability negotiation.
 - Tool/resource/prompt registration and dispatch.
-- SSE connection lifecycle.
+- SSE connection lifecycle management.
 
-The SSE transport is hosted inside a FastAPI/Uvicorn application automatically by FastMCP.
+### Tenant Context Injection
+
+Each request resolves tenant context before tool execution:
+
+```python
+# middleware.py
+class TenantContext:
+    tenant_id: str
+    config: TenantConfig      # mode, dry_run_default, max_order_usd
+    braiins_client: BraiinsClient  # pre-initialized with tenant credentials
+
+# tools.py — tenant context accessed per-call
+async def _get_tenant_context(request_headers: dict) -> TenantContext:
+    tenant_id = request_headers.get("x-tenant-id")
+    config = await tenant_config_loader.get(tenant_id)
+    client = BraiinsClient(config.api_key, config.secret)
+    return TenantContext(tenant_id=tenant_id, config=config, braiins_client=client)
+```
 
 ---
 
-## 4. Tools
+## 5. Tools
 
 Tools are **model-invoked actions**. The model calls them to retrieve data or perform mutations. All tools return a normalized response envelope.
 
-### 4.1 Response Envelope
+### 5.1 Response Envelope
 
 Every tool returns a JSON object matching:
 
@@ -113,9 +170,10 @@ class MCPToolResponse(BaseModel):
     error: str | None = None
     request_id: str | None = None
     raw_api_status: int | None = None
+    tenant_id: str | None = None  # included for audit transparency
 ```
 
-### 4.2 Tool Definitions
+### 5.2 Tool Definitions
 
 ---
 
@@ -138,8 +196,9 @@ async def get_market_settings() -> MCPToolResponse:
 
 **Input schema:** none  
 **Trust level:** Safe read  
-**Caching:** 60-second TTL in `settings_cache.py`  
-**Mapped endpoint:** `GET /spot/settings`
+**Caching:** Per-tenant Redis key with 60s TTL and distributed lock on refresh  
+**Mapped endpoint:** `GET /spot/settings`  
+**Metrics:** `mcp_tool_calls_total{tool="get_market_settings"}`
 
 ---
 
@@ -163,11 +222,11 @@ async def get_orderbook(
 **Input schema:**
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `market` | `"spot"` | `"spot"` | Market identifier (only spot supported in v0.1) |
+| `market` | `"spot"` | `"spot"` | Market identifier (only spot in v0.2) |
 | `depth` | `int` | `20` | Number of levels to return per side |
 
 **Trust level:** Safe read  
-**Mapped endpoint:** `GET /spot/orderbook` or equivalent in Swagger spec
+**Mapped endpoint:** `GET /spot/orderbook` or equivalent
 
 ---
 
@@ -183,7 +242,7 @@ async def list_orders(
     cursor: str | None = None
 ) -> MCPToolResponse:
     """
-    Return a paginated list of the authenticated user's orders.
+    Return a paginated list of the authenticated tenant's orders.
     Defaults to all statuses if status is not specified.
     Use cursor for pagination.
     """
@@ -197,7 +256,7 @@ async def list_orders(
 | `cursor` | `str` | `None` | Pagination cursor from previous response |
 
 **Trust level:** Safe read  
-**Mapped endpoint:** `GET /spot/orders` or `/orders` per Swagger
+**Mapped endpoint:** `GET /spot/orders`
 
 ---
 
@@ -209,7 +268,7 @@ Return balance, exposure, and account-level metadata.
 @mcp.tool()
 async def get_account_summary() -> MCPToolResponse:
     """
-    Return the authenticated account's current balance, open order
+    Return the authenticated tenant's current balance, open order
     exposure, and account-level metadata from Braiins Hashpower.
     """
 ```
@@ -244,7 +303,7 @@ async def get_deliveries(
 | `cursor` | `str` | `None` | Pagination cursor |
 
 **Trust level:** Safe read  
-**Mapped endpoint:** `GET /deliveries` or equivalent per Swagger
+**Mapped endpoint:** `GET /deliveries` or equivalent
 
 ---
 
@@ -270,6 +329,7 @@ async def create_bid(
 
     dry_run=true (default) validates and returns a preview without
     submitting to the API. Set dry_run=false to place a live order.
+    Requires tenant mode=trading. Blocked in read_only mode.
     """
 ```
 
@@ -279,17 +339,52 @@ async def create_bid(
 | `amount` | `float` | required | Bid size in `hr_unit` from settings |
 | `price` | `float` | required | Bid price in `price_sat` from settings |
 | `market` | `"spot"` | `"spot"` | Market identifier |
-| `client_order_id` | `str` | auto-generated | Idempotency key |
-| `dry_run` | `bool` | `true` | Preview without submitting if true |
+| `client_order_id` | `str` | auto-generated UUID | Idempotency key — checked against Redis before submit |
+| `dry_run` | `bool` | `true` (or tenant config default) | Preview without submitting if true |
 
-**Trust level:** Sensitive write (requires `BRAIINS_MODE=trading`)  
-**Pre-flight validation:**
-1. Fetch or use cached `/spot/settings`.
-2. Validate `amount` within `min_amount`/`max_amount` bounds from settings.
-3. Validate `price` is positive and within reasonable bounds.
-4. Check `amount * price` ≤ `BRAIINS_MAX_ORDER_USD` (converted).
-5. Reject if `BRAIINS_MODE=read_only`.
-6. If `dry_run=false`, require `BRAIINS_DRY_RUN_DEFAULT=false` in env or explicit override.
+**Trust level:** Sensitive write (requires tenant `mode=trading`)  
+**Pre-flight validation flow:**
+
+```
+create_bid called
+     │
+     ▼
+tenant.mode == "read_only"?  ─── YES ──► Return error: "Tenant in read_only mode"
+     │ NO
+     ▼
+Check idempotency: Redis GET idempotency:{tenant_id}:{client_order_id}
+   └── EXISTS ──► Return cached result (no duplicate submission)
+     │
+     ▼
+Fetch /spot/settings (per-tenant Redis cache)
+     │
+     ▼
+Validate amount within [min_amount, max_amount] from settings
+     │
+     ▼
+Validate price > 0 and within sanity bounds
+     │
+     ▼
+Validate notional <= tenant.max_order_usd
+     │
+     ▼
+dry_run == true?  ─── YES ──► Return preview (no API call, no Redis write)
+     │ NO
+     ▼
+POST /spot/bid → Braiins API
+     │
+     ▼
+Store result in Redis idempotency:{tenant_id}:{client_order_id} (24h TTL)
+     │
+     ▼
+Write to PostgreSQL orders table
+     │
+     ▼
+Emit mcp_orders_placed_total metric
+     │
+     ▼
+Return MCPToolResponse
+```
 
 **Mapped endpoint:** `POST /spot/bid`
 
@@ -307,6 +402,7 @@ async def cancel_order(
     """
     Cancel an open order on the Braiins Hashpower spot market by
     its order ID. Use list_orders to retrieve valid order IDs.
+    Requires tenant mode=trading. Blocked in read_only mode.
     """
 ```
 
@@ -315,21 +411,23 @@ async def cancel_order(
 |-------|------|-------------|
 | `order_id` | `str` | The order ID to cancel |
 
-**Trust level:** Sensitive write (requires `BRAIINS_MODE=trading`)  
-**Mapped endpoint:** `DELETE /spot/orders/{order_id}` or equivalent per Swagger
+**Trust level:** Sensitive write (requires tenant `mode=trading`)  
+**Mapped endpoint:** `DELETE /spot/orders/{order_id}` or equivalent
 
 ---
 
-## 5. Resources
+## 6. Resources
 
 Resources are **application-exposed context** that clients and models can read. They use URI addressing and are suitable for caching, pre-loading context, and providing stable reference data.
+
+Resources are scoped to the authenticated tenant. The URI scheme uses a `{tenant_id}` path prefix in the server-side resolution layer, even though clients address them by the logical URI.
 
 ### Resource Definitions
 
 | URI | MIME Type | TTL | Description |
 |-----|-----------|-----|-------------|
 | `braiins://spot/settings` | `application/json` | 60s | Spot market settings and unit metadata |
-| `braiins://account/orders/open` | `application/json` | 10s | Snapshot of currently open orders |
+| `braiins://account/orders/open` | `application/json` | 10s | Snapshot of tenant's open orders |
 | `braiins://account/orders/history` | `application/json` | 60s | Last 50 filled/canceled orders |
 | `braiins://account/summary` | `application/json` | 30s | Account balance and exposure |
 | `braiins://docs/error-codes` | `application/json` | static | Normalized Braiins API error catalog |
@@ -339,19 +437,14 @@ Resources are **application-exposed context** that clients and models can read. 
 async def resource_spot_settings() -> str:
     """Current Braiins Hashpower spot market settings including
     price units (price_sat) and hashrate units (hr_unit)."""
-    settings = await get_cached_settings()
+    # tenant_id resolved from request context
+    settings = await settings_cache.get(tenant_id)
     return settings.model_dump_json()
-
-@mcp.resource("braiins://account/orders/open")
-async def resource_open_orders() -> str:
-    """Read-only snapshot of the authenticated account's open orders."""
-    orders = await braiins_client.list_orders(status=["open"])
-    return json.dumps(orders)
 ```
 
 ---
 
-## 6. Prompts
+## 7. Prompts
 
 Prompts are **reusable user-invoked workflows** that guide the agent through multi-step tasks. They do not call tools directly but compose instructions that lead the agent to call the right tools in sequence.
 
@@ -364,15 +457,7 @@ Prompts are **reusable user-invoked workflows** that guide the agent through mul
 ```python
 @mcp.prompt()
 def prompt_conservative_bid() -> str:
-    """
-    Guided workflow for placing a conservative spot bid.
-    Steps:
-    1. Call get_market_settings to understand current units.
-    2. Call get_orderbook to inspect current depth and mid-market price.
-    3. Compose a bid below the current best ask by at least 1%.
-    4. Call create_bid with dry_run=true to preview.
-    5. Ask the user to confirm before setting dry_run=false.
-    """
+    """Guided workflow for placing a conservative spot bid."""
     return """
     You are helping a user place a conservative bid on Braiins Hashpower.
 
@@ -393,10 +478,7 @@ def prompt_conservative_bid() -> str:
 ```python
 @mcp.prompt()
 def prompt_review_open_orders() -> str:
-    """
-    Summarize open order exposure and recommend actions without
-    mutating any state.
-    """
+    """Summarize open order exposure and recommend actions without mutating state."""
     return """
     Review the user's current open orders on Braiins Hashpower.
 
@@ -417,10 +499,7 @@ def prompt_review_open_orders() -> str:
 ```python
 @mcp.prompt()
 def prompt_explain_units() -> str:
-    """
-    Explain Braiins Hashpower spot-market units and pricing semantics
-    to the user before they place any order.
-    """
+    """Explain Braiins Hashpower spot-market units and pricing semantics."""
     return """
     Explain the Braiins Hashpower spot market pricing model to the user.
 
@@ -435,66 +514,87 @@ def prompt_explain_units() -> str:
 
 ---
 
-## 7. Configuration Reference
+## 8. Configuration Reference
+
+### Per-Deployment (environment / Kubernetes secrets)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BRAIINS_API_BASE_URL` | Yes | — | `https://hashpower.braiins.com/api` |
-| `BRAIINS_API_KEY` | Yes | — | Braiins API key |
-| `BRAIINS_API_SECRET` | Yes | — | Braiins API secret for request signing |
-| `BRAIINS_MODE` | No | `read_only` | `read_only` or `trading` |
-| `BRAIINS_DRY_RUN_DEFAULT` | No | `true` | Default dry_run value for create_bid |
-| `BRAIINS_MAX_ORDER_USD` | No | `500` | Max notional per order in USD |
-| `BRAIINS_SETTINGS_CACHE_TTL` | No | `60` | /spot/settings cache TTL in seconds |
+| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
+| `REDIS_URL` | Yes | — | Redis connection string (cluster or single) |
+| `KMS_KEY_ID` | Yes (prod) | — | KMS key ID for credential decryption |
 | `MCP_SERVER_HOST` | No | `0.0.0.0` | SSE server bind host |
 | `MCP_SERVER_PORT` | No | `8765` | SSE server port |
+| `MAX_CONNECTIONS_PER_NODE` | No | `500` | Max concurrent SSE connections per pod |
 | `LOG_LEVEL` | No | `INFO` | Python logging level |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | OpenTelemetry collector endpoint |
+
+### Single-Tenant / Development Mode
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_SINGLE_TENANT_MODE` | `false` | Bypass multi-tenant auth |
+| `SINGLE_TENANT_API_KEY` | — | Static API key for dev mode |
+| `BRAIINS_API_BASE_URL` | `https://hashpower.braiins.com/api` | API base URL |
+| `BRAIINS_API_KEY` | — | Direct Braiins API key (single-tenant only) |
+| `BRAIINS_API_SECRET` | — | Direct Braiins API secret (single-tenant only) |
+| `BRAIINS_MODE` | `read_only` | `read_only` or `trading` |
+| `BRAIINS_DRY_RUN_DEFAULT` | `true` | Default dry_run value for create_bid |
+| `BRAIINS_MAX_ORDER_USD` | `500` | Max notional per order in USD |
+
+### Per-Tenant (PostgreSQL `tenants` table)
+
+| Column | Description |
+|--------|-------------|
+| `braiins_api_key` | Encrypted Braiins API key |
+| `braiins_secret` | Encrypted Braiins API secret |
+| `mode` | `read_only` or `trading` |
+| `dry_run_default` | Default dry_run value for this tenant |
+| `max_order_usd` | Per-tenant spend cap |
+| `rate_limit_rpm` | Requests per minute limit |
 
 ---
 
-## 8. Safety Model
+## 9. Safety Model
 
-### Trust Tiers
+### 9.1 Trust Tiers
 
 | Tier | Tools | Gate |
 |------|-------|------|
 | Safe read | `get_market_settings`, `get_orderbook`, `list_orders`, `get_account_summary`, `get_deliveries` | No gate |
-| Sensitive write | `create_bid`, `cancel_order` | `BRAIINS_MODE=trading` + `dry_run` default |
-| Future: High-risk | Bulk cancel, ladder placement | Explicit `BRAIINS_ALLOW_BULK=true` (not in v0.1) |
+| Sensitive write | `create_bid`, `cancel_order` | `tenant.mode=trading` + `dry_run` default |
+| Future: High-risk | Bulk cancel, ladder placement | Explicit `allow_bulk=true` tenant flag (v0.3) |
 
-### Pre-flight Validation Flow (create_bid)
+### 9.2 Multi-Layer Safety Stack
 
 ```
-create_bid called
-     │
-     ▼
-BRAIINS_MODE == "read_only"?  ─── YES ──► Return error: "Server in read_only mode"
-     │ NO
-     ▼
-Fetch /spot/settings (cached)
-     │
-     ▼
-Validate amount within [min_amount, max_amount]
-     │
-     ▼
-Validate price > 0 and within sanity bounds
-     │
-     ▼
-Validate notional <= BRAIINS_MAX_ORDER_USD
-     │
-     ▼
-dry_run == true?  ─── YES ──► Return preview (no API call)
-     │ NO
-     ▼
-POST /spot/bid
-     │
-     ▼
-Return MCPToolResponse
+Agent request
+    │
+    ▼
+[Layer 1] API Gateway: Bearer token auth, global rate limit
+    │
+    ▼
+[Layer 2] MCP Node: tenant.mode check (read_only blocks writes)
+    │
+    ▼
+[Layer 3] Idempotency: client_order_id Redis check (deduplication)
+    │
+    ▼
+[Layer 4] Settings validation: amount/price vs. /spot/settings bounds
+    │
+    ▼
+[Layer 5] Spend cap: notional <= tenant.max_order_usd
+    │
+    ▼
+[Layer 6] dry_run gate: preview mode by default, explicit false required
+    │
+    ▼
+Braiins API call
 ```
 
 ---
 
-## 9. Error Handling
+## 10. Error Handling
 
 All Braiins API errors are mapped to structured MCP tool errors via `errors.py`:
 
@@ -511,94 +611,140 @@ BRAIINS_ERROR_MAP = {
 }
 ```
 
-All tools return `success=False` with a human-readable `error` string and the `raw_api_status` code. The model should surface the `error` string to the user without exposing raw HTTP details.
+All tools return `success=False` with a human-readable `error` string and `raw_api_status`. Auth errors from the tenant credential layer use `AUTHENTICATION_FAILED` and are indistinguishable from Braiins-level auth errors (no tenant info is leaked in error messages).
+
+### Circuit Breaker (Braiins API)
+
+```python
+# client.py — using tenacity
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=0.5, max=4),
+    retry=retry_if_exception_type(httpx.TransportError),
+    reraise=True,
+)
+async def _call_braiins_api(self, method, path, **kwargs):
+    ...
+```
+
+After 10 consecutive 5xx responses from Braiins, a circuit breaker opens and all calls fail fast with `BRAIINS_UNAVAILABLE` for 30 seconds before a half-open probe.
 
 ---
 
-## 10. Module Responsibilities
+## 11. Module Responsibilities
 
 | Module | Responsibility |
 |--------|---------------|
-| `server.py` | FastMCP instantiation, SSE transport startup, environment loading |
+| `server.py` | FastMCP instantiation, SSE transport startup, health/ready endpoints |
+| `middleware.py` | Tenant context resolution from `X-Tenant-Id` header |
 | `mcp/tools.py` | `@mcp.tool()` definitions; input parsing; delegate to braiins/ and safety/ |
-| `mcp/resources.py` | `@mcp.resource()` definitions; TTL caching; serialization |
+| `mcp/resources.py` | `@mcp.resource()` definitions; TTL caching; tenant-scoped serialization |
 | `mcp/prompts.py` | `@mcp.prompt()` definitions; static prompt strings |
 | `mcp/schemas.py` | Pydantic models for all tool inputs and `MCPToolResponse` |
-| `braiins/client.py` | Async httpx client; base URL; timeout; retry via tenacity |
-| `braiins/auth.py` | HMAC/API key request signing for Braiins API |
-| `braiins/settings_cache.py` | TTL cache for `/spot/settings`; exposes `get_cached_settings()` |
+| `braiins/client.py` | Async httpx client; circuit breaker; retry via tenacity |
+| `braiins/auth.py` | HMAC/API key request signing; credential decryption via KMS |
+| `braiins/settings_cache.py` | Per-tenant Redis cache for `/spot/settings` with distributed lock |
 | `braiins/orders.py` | `list_orders`, `create_bid`, `cancel_order` API calls |
 | `braiins/market.py` | `get_orderbook`, `get_deliveries` API calls |
-| `braiins/errors.py` | HTTP status → structured MCP error mapping |
-| `safety/approvals.py` | `BRAIINS_MODE` check; write-action gate |
-| `safety/limits.py` | `BRAIINS_MAX_ORDER_USD` enforcement |
-| `safety/validators.py` | Unit normalization against settings; pre-flight amount/price checks |
+| `braiins/errors.py` | HTTP status → structured MCP error mapping; circuit breaker |
+| `tenants/loader.py` | Tenant config loader with Redis cache and PostgreSQL fallback |
+| `tenants/models.py` | `TenantConfig`, `TenantContext` Pydantic models |
+| `safety/approvals.py` | Tenant mode check; write-action gate |
+| `safety/limits.py` | Per-tenant `max_order_usd` enforcement |
+| `safety/validators.py` | Unit normalization against settings; pre-flight checks |
+| `safety/idempotency.py` | Redis idempotency key check and store |
+| `infra/redis.py` | Redis connection pool; distributed lock helpers |
+| `infra/postgres.py` | Async PostgreSQL pool (asyncpg) |
+| `infra/metrics.py` | Prometheus counters, histograms, gauges |
+| `infra/tracing.py` | OpenTelemetry tracer setup and span helpers |
+| `infra/logging.py` | structlog configuration; structured JSON output |
 
 ---
 
-## 11. Dependencies
+## 12. Dependencies
 
 ```toml
 [project]
 name = "braiins-hashpower-mcp"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[server]>=1.9.1",
     "httpx>=0.27.0",
     "fastapi>=0.115.0",
-    "uvicorn>=0.30.0",
+    "uvicorn[standard]>=0.30.0",
     "pydantic>=2.7.0",
     "tenacity>=8.3.0",
     "python-dotenv>=1.0.0",
+    "redis[hiredis]>=5.0.0",
+    "asyncpg>=0.29.0",
+    "structlog>=24.0.0",
+    "prometheus-client>=0.20.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp>=1.24.0",
+    "cryptography>=42.0.0",
+    "bcrypt>=4.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "respx>=0.21",       # httpx mock
+    "respx>=0.21",
     "ruff>=0.4",
     "mypy>=1.10",
-    "langchain-mcp-adapters>=0.1.0",  # for integration tests
+    "langchain-mcp-adapters>=0.1.0",
+    "fakeredis>=2.23",
+    "pytest-postgresql>=6.0",
 ]
 ```
 
 ---
 
-## 12. Testing Strategy
+## 13. Testing Strategy
 
 | Test Layer | Tool | Coverage |
 |------------|------|---------|
 | Unit: tool logic | pytest + respx | All 7 tools; success and error paths |
-| Unit: safety validators | pytest | Boundary checks, `read_only` gate, spend cap |
-| Unit: settings cache | pytest | TTL expiry, refresh behavior |
+| Unit: safety validators | pytest | Boundary checks, mode gate, spend cap |
+| Unit: settings cache | pytest + fakeredis | TTL expiry, distributed lock, refresh |
+| Unit: idempotency | pytest + fakeredis | Dedup on second call, 24h TTL |
+| Unit: tenant loader | pytest + fakeredis + pytest-postgresql | Config cache hit/miss |
 | Integration: SSE transport | pytest-asyncio + langchain-mcp-adapters | Full round-trip via `MultiServerMCPClient` |
-| Integration: dry_run | pytest-asyncio | `create_bid` with dry_run=true never hits API |
+| Integration: multi-tenant | pytest-asyncio | Two tenants, isolated settings caches and creds |
+| Integration: dry_run | pytest-asyncio | `create_bid` with dry_run=true never hits Braiins API |
+| Load: SSE connections | locust | 500 concurrent SSE connections per node |
 
 ---
 
-## 13. Versioning and Roadmap
+## 14. Versioning and Roadmap
 
-### v0.1 (this spec)
-- SSE transport
+### v0.1 (initial spec)
+- Single-tenant SSE transport
 - 7 tools (5 safe read, 2 sensitive write)
 - 5 resources
 - 3 prompts
 - `dry_run` default, `read_only` mode, spend cap
 
-### v0.2 (planned)
-- `streamable_http` transport option
-- Order replace/amend tool
-- Approval flow integration (human-in-the-loop before live orders)
-- Structured logging with `structlog`
-- Docker image and Compose file
+### v0.2 (this spec)
+- Multi-tenant support with per-tenant credential isolation
+- Stateless nodes with Redis shared state
+- PostgreSQL audit log and order mirror
+- API gateway + auth service integration
+- Idempotency via Redis
+- Prometheus metrics, structlog, OpenTelemetry tracing
+- Circuit breaker for Braiins API
+- Health/ready endpoints for Kubernetes
+- `streamable_http` as secondary transport option
+- Docker Compose dev stack
 
 ### v0.3 (planned)
-- Hashrate ladder / DCA prompt
+- Hashrate DCA / ladder placement prompt
 - Portfolio exposure resource
-- Prometheus metrics endpoint
-- Multi-account profile support
+- ClickHouse integration for analytics-scale audit queries
+- Multi-account / sub-account support
+- Human-in-the-loop approval flow for live orders
+- Bulk cancel tool (high-risk tier, explicit opt-in)
 
 ---
 
@@ -607,6 +753,7 @@ dev = [
 - [Braiins Hashpower API Reference](https://hashpower.braiins.com/api/)
 - [Braiins Academy: Public API](https://academy.braiins.com/en/braiins-hashpower/api/)
 - [langchain-mcp-adapters GitHub](https://github.com/langchain-ai/langchain-mcp-adapters)
-- [FastMCP Documentation](https://github.com/jlowin/fastmcp)
-- [Model Context Protocol Specification](https://modelcontextprotocol.io)
+- [FastMCP / mcp SDK](https://github.com/jlowin/fastmcp)
+- [Model Context Protocol — Server Concepts](https://modelcontextprotocol.io/docs/learn/server-concepts)
 - [LangGraph Prebuilt Agents](https://langchain-ai.github.io/langgraph/reference/prebuilt/)
+- ARCHITECTURE.md (this repository)
