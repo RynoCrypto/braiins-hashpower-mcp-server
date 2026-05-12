@@ -29,6 +29,15 @@ from braiins_hashpower_mcp.braiins.orders import (
     list_bids as _list_bids,
 )
 from braiins_hashpower_mcp.mcp.schemas import MCPToolResponse
+from braiins_hashpower_mcp.safety import (
+    ApprovalError,
+    ApprovalGate,
+    IdempotencyStore,
+    LimitError,
+    SpendLimiter,
+    UnitValidator,
+    ValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +61,11 @@ def _error(exc: BraiinsError, request_id: str) -> MCPToolResponse:
 
 def register_tools(mcp: FastMCP, client: BraiinsClient) -> None:
     """Attach all Braiins tools to a FastMCP instance."""
+
+    gate = ApprovalGate()
+    limiter = SpendLimiter()
+    validator = UnitValidator()
+    idempotency = IdempotencyStore()
 
     @mcp.tool()
     async def get_market_settings() -> MCPToolResponse:
@@ -136,8 +150,8 @@ def register_tools(mcp: FastMCP, client: BraiinsClient) -> None:
         dest_upstream: str,
         amount_sat: int,
         price_sat: int,
+        client_order_id: str,
         market: Literal["spot"] = "spot",
-        client_order_id: str | None = None,
         dry_run: bool = True,
     ) -> MCPToolResponse:
         """Place a bid on the Braiins Hashpower spot market.
@@ -150,20 +164,34 @@ def register_tools(mcp: FastMCP, client: BraiinsClient) -> None:
         submitting to the API. Set dry_run=false to place a live order.
         """
         req_id = _make_request_id()
-        if dry_run:
-            return _success(
-                {
-                    "preview": True,
-                    "dest_upstream": dest_upstream,
-                    "amount_sat": amount_sat,
-                    "price_sat": price_sat,
-                    "market": market,
-                    "client_order_id": client_order_id,
-                    "note": "Dry-run preview; no live order submitted.",
-                },
-                req_id,
-            )
+        params = {
+            "dest_upstream": dest_upstream,
+            "amount_sat": amount_sat,
+            "price_sat": price_sat,
+            "market": market,
+            "client_order_id": client_order_id,
+        }
         try:
+            validator.validate_bid(dest_upstream, amount_sat, price_sat)
+            limiter.check_bid(amount_sat, price_sat)
+            gate.check_read_only("create_bid")
+
+            is_new, cached = idempotency.check(client_order_id)
+            if not is_new:
+                return _success(
+                    {
+                        "duplicate": True,
+                        "client_order_id": client_order_id,
+                        "cached_result": cached,
+                    },
+                    req_id,
+                )
+
+            preview = gate.gate_write("create_bid", params, dry_run)
+            if preview:
+                gate.log_attempt("create_bid", params, True, "dry_run_preview")
+                return _success(preview, req_id)
+
             data = await _create_bid(
                 client,
                 dest_upstream=dest_upstream,
@@ -171,32 +199,47 @@ def register_tools(mcp: FastMCP, client: BraiinsClient) -> None:
                 price_sat=price_sat,
                 cl_order_id=client_order_id,
             )
+            idempotency.store(client_order_id, data)
+            gate.log_attempt("create_bid", data, False, "success")
             return _success(data, req_id)
+        except (ValidationError, LimitError, ApprovalError) as exc:
+            gate.log_attempt("create_bid", params, dry_run, f"blocked: {exc.message}")
+            return _error(exc, req_id)
         except BraiinsError as exc:
+            gate.log_attempt("create_bid", params, dry_run, f"api_error: {exc.message}")
             return _error(exc, req_id)
 
     @mcp.tool()
     async def cancel_order(
         order_id: str | None = None,
         client_order_id: str | None = None,
+        dry_run: bool = True,
     ) -> MCPToolResponse:
         """Cancel an open order on the Braiins Hashpower spot market.
 
         Use list_orders to retrieve valid order IDs.
         """
         req_id = _make_request_id()
-        if not order_id and not client_order_id:
-            return MCPToolResponse(
-                success=False,
-                error="Either order_id or client_order_id must be provided.",
-                request_id=req_id,
-            )
+        params = {"order_id": order_id, "client_order_id": client_order_id}
         try:
+            validator.validate_cancel(order_id, client_order_id)
+            gate.check_read_only("cancel_order")
+
+            preview = gate.gate_write("cancel_order", params, dry_run)
+            if preview:
+                gate.log_attempt("cancel_order", params, True, "dry_run_preview")
+                return _success(preview, req_id)
+
             data = await _cancel_bid(
                 client,
                 order_id=order_id,
                 cl_order_id=client_order_id,
             )
+            gate.log_attempt("cancel_order", data, False, "success")
             return _success(data, req_id)
+        except (ValidationError, ApprovalError) as exc:
+            gate.log_attempt("cancel_order", params, dry_run, f"blocked: {exc.message}")
+            return _error(exc, req_id)
         except BraiinsError as exc:
+            gate.log_attempt("cancel_order", params, dry_run, f"api_error: {exc.message}")
             return _error(exc, req_id)

@@ -131,6 +131,7 @@ class TestTools:
                     "dest_upstream": "up1",
                     "amount_sat": 1000,
                     "price_sat": 50,
+                    "client_order_id": "test-dry-123",
                     "dry_run": True,
                 },
             )
@@ -152,6 +153,7 @@ class TestTools:
                     "dest_upstream": "up1",
                     "amount_sat": 1000,
                     "price_sat": 50,
+                    "client_order_id": "test-live-123",
                     "dry_run": False,
                 },
             )
@@ -160,12 +162,53 @@ class TestTools:
         assert parsed.data == {"bid_id": "B999"}
 
     @pytest.mark.anyio
+    async def test_create_bid_idempotent(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        mock_client._client.request.return_value = _mock_response(
+            200, {"bid_id": "B999"}
+        )
+        parsed1 = _parse_tool_response(
+            await mcp_app.call_tool(
+                "create_bid",
+                {
+                    "dest_upstream": "up1",
+                    "amount_sat": 1000,
+                    "price_sat": 50,
+                    "client_order_id": "idem-1",
+                    "dry_run": False,
+                },
+            )
+        )
+        assert parsed1.success is True
+        assert parsed1.data == {"bid_id": "B999"}
+
+        parsed2 = _parse_tool_response(
+            await mcp_app.call_tool(
+                "create_bid",
+                {
+                    "dest_upstream": "up1",
+                    "amount_sat": 1000,
+                    "price_sat": 50,
+                    "client_order_id": "idem-1",
+                    "dry_run": False,
+                },
+            )
+        )
+        assert parsed2.success is True
+        assert parsed2.data.get("duplicate") is True
+        assert parsed2.data.get("cached_result") == {"bid_id": "B999"}
+        assert mock_client._client.request.call_count == 1
+
+    @pytest.mark.anyio
     async def test_cancel_order_success(
         self, mcp_app: FastMCP, mock_client: BraiinsClient
     ) -> None:
         mock_client._client.request.return_value = _mock_response(204)
         parsed = _parse_tool_response(
-            await mcp_app.call_tool("cancel_order", {"order_id": "B123"})
+            await mcp_app.call_tool(
+                "cancel_order", {"order_id": "B123", "dry_run": False}
+            )
         )
         assert parsed.success is True
 

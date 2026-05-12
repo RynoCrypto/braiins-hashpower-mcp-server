@@ -49,11 +49,11 @@ class CreateBidInput(BaseModel):
     dest_upstream: str = Field(..., min_length=1, description="Destination upstream ID")
     amount_sat: int = Field(..., gt=0, description="Bid amount in satoshi")
     price_sat: int = Field(..., gt=0, description="Bid price in satoshi")
-    market: Literal["spot"] = "spot"
-    client_order_id: str | None = Field(
-        default=None,
-        description="Idempotency key; auto-generated if omitted",
+    client_order_id: str = Field(
+        ...,
+        description="Idempotency key; required for all bids",
     )
+    market: Literal["spot"] = "spot"
     dry_run: bool = Field(
         default=True,
         description="Preview only; no live order submitted when true",

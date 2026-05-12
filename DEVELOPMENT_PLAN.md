@@ -1,7 +1,7 @@
 # Braiins Hashpower MCP Server — Development Plan
 
 **Version:** 0.1  
-**Status:** Phase 3 complete / Phase 4 pending  
+**Status:** Phase 4 complete / Phase 5 pending  
 **Last Updated:** 2026-05-12
 
 ---
