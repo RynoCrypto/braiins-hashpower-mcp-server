@@ -1,0 +1,1 @@
+"""Write-action gate flags."""
