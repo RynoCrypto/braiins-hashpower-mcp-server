@@ -1,8 +1,8 @@
 # Braiins Hashpower MCP Server — Development Plan
 
 **Version:** 0.1  
-**Status:** Pre-release / Spec-only  
-**Last Updated:** 2026-05-11
+**Status:** Phase 3 complete / Phase 4 pending  
+**Last Updated:** 2026-05-12
 
 ---
 
@@ -49,14 +49,16 @@ This plan moves `braiins-hashpower-mcp` from spec (README-only) to a production-
 
 ### Phase 3: MCP Server Core
 
-| Task | Deliverable | Exit Criteria |
-|------|-------------|---------------|
-| 3.1 Define Pydantic schemas in `schemas.py` | Input/output models for all tools and resources | `mypy` passes; all fields have types and descriptions |
-| 3.2 Implement tools in `mcp/tools.py` | All 7 tools decorated with `@mcp.tool()` | Client can list tools via SSE; schema introspection works |
-| 3.3 Implement resources in `mcp/resources.py` | All 5 resources decorated with `@mcp.resource()` | `read_resource(uri)` returns correct payload per URI |
-| 3.4 Implement prompts in `mcp/prompts.py` | All 3 prompts decorated with `@mcp.prompt()` | Prompt templates render with injected context |
-| 3.5 Wire FastMCP + SSE in `server.py` | `mcp = FastMCP(...)`; SSE endpoint exposed via `uvicorn` | `GET /sse` returns 200; MCP inspector connects |
-| 3.6 Add health/readiness endpoints | `/healthz` and `/readyz` for deployment orchestrators | Return 200 when cache warm and API reachable |
+| Task | Deliverable | Exit Criteria | Status |
+|------|-------------|---------------|--------|
+| 3.1 Define Pydantic schemas in `schemas.py` | Input/output models for all tools and resources | `mypy` passes; all fields have types and descriptions | Done |
+| 3.2 Implement tools in `mcp/tools.py` | All 7 tools decorated with `@mcp.tool()` | Client can list tools via SSE; schema introspection works | Done |
+| 3.3 Implement resources in `mcp/resources.py` | All 5 resources decorated with `@mcp.resource()` | `read_resource(uri)` returns correct payload per URI | Done |
+| 3.4 Implement prompts in `mcp/prompts.py` | All 3 prompts decorated with `@mcp.prompt()` | Prompt templates render with injected context | Done |
+| 3.5 Wire FastMCP + SSE in `server.py` | `mcp = FastMCP(...)`; SSE endpoint exposed via `uvicorn` | `GET /sse` returns 200; MCP inspector connects | Done |
+| 3.6 Add health/readiness endpoints | `/health` and `/ready` for deployment orchestrators | Return 200 when initialized; 503 if not ready | Done |
+
+**Completed on:** 2026-05-12
 
 **Risk:** MCP protocol version drift. Mitigation: pin `mcp[server]` to exact version; test against `langchain-mcp-adapters` before any bump.
 
