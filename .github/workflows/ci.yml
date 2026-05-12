@@ -57,9 +57,7 @@ jobs:
       - name: Bandit
         run: uv run bandit -r braiins_hashpower_mcp/ -f json -o bandit-report.json || true
       - name: Semgrep
-        run: |
-          python -m pip install semgrep
-          semgrep --config=auto --error braiins_hashpower_mcp/ || true
+        run: uvx semgrep --config=auto --error braiins_hashpower_mcp/ || true
       - name: Upload Bandit report
         if: always()
         uses: actions/upload-artifact@v4
