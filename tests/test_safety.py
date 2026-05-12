@@ -182,3 +182,52 @@ class TestIdempotencyStore:
         assert is_new is True
         is_new, _ = store.check("k4")
         assert is_new is False
+
+    def test_store_none_key_ignored(self) -> None:
+        store = IdempotencyStore()
+        store.store(None, "ignored")
+        # Should not crash and store should remain empty
+        is_new, cached = store.check(None)
+        assert is_new is True
+        assert cached is None
+
+
+class TestSpendLimiterEnvExtended:
+    def test_env_usd(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRAIINS_MAX_ORDER_USD", "5000.0")
+        limiter = SpendLimiter()
+        assert limiter.max_order_usd == 5000.0
+        limiter.check_bid(1_000_000)
+        with pytest.raises(LimitError):
+            limiter.check_bid(6_000_000_000)
+
+    def test_env_rate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BRAIINS_BTC_USD_RATE", "50000.0")
+        limiter = SpendLimiter(max_order_usd=1.0)
+        assert limiter.btc_usd_rate == 50000.0
+        limiter.check_bid(1000)
+        with pytest.raises(LimitError):
+            limiter.check_bid(3_000_000)
+
+
+class TestUnitValidatorBounds:
+    def test_max_amount_rejected(self) -> None:
+        validator = UnitValidator()
+        settings = {"max_amount_sat": 1000}
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_bid("up1", 2000, 50, settings)
+        assert "above market maximum" in exc_info.value.message
+
+    def test_min_price_rejected(self) -> None:
+        validator = UnitValidator()
+        settings = {"min_price_sat": 50}
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_bid("up1", 1000, 10, settings)
+        assert "below market minimum" in exc_info.value.message
+
+    def test_max_price_rejected(self) -> None:
+        validator = UnitValidator()
+        settings = {"max_price_sat": 100}
+        with pytest.raises(ValidationError) as exc_info:
+            validator.validate_bid("up1", 1000, 200, settings)
+        assert "above market maximum" in exc_info.value.message

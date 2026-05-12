@@ -73,7 +73,7 @@ def _ready_handler(_request: Request) -> JSONResponse:
 
 def main() -> None:
     """Run the MCP server over SSE transport."""
-    host = os.getenv("MCP_SERVER_HOST", "0.0.0.0")
+    host = os.getenv("MCP_SERVER_HOST", "0.0.0.0")  # nosec: B104
     port = int(os.getenv("MCP_SERVER_PORT", "8765"))
     app = mcp.sse_app()
     app.add_route("/health", _health_handler)

@@ -24,7 +24,7 @@ class ApprovalGate:
         mode: str | None = None,
         dry_run_default: bool = True,
     ) -> None:
-        self.mode = (mode or os.getenv("BRAIINS_MODE", "read_write")).lower().strip()
+        self.mode = (mode or os.getenv("BRAIINS_MODE") or "read_write").lower().strip()
         self.dry_run_default = dry_run_default
         if os.getenv("BRAIINS_DRY_RUN_DEFAULT", "").lower() in ("0", "false", "no"):
             self.dry_run_default = False

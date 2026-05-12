@@ -103,7 +103,7 @@ class BraiinsClient:
             if isinstance(payload, dict):
                 message = payload.get("message") or payload.get("error") or str(payload)
                 return {"message": message, "details": payload}
-        except Exception:
+        except (ValueError, TypeError):
             pass
 
         # Fallback to grpc-message header (URL-encoded per Braiins docs)

@@ -240,11 +240,181 @@ class TestResources:
         assert '{"hr_unit": "PH/day"}' in text
 
     @pytest.mark.anyio
+    async def test_open_orders_resource(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        mock_client._client.request.return_value = _mock_response(200, {"bids": [{"id": "B1"}]})
+        contents = await mcp_app.read_resource("braiins://account/orders/open")
+        text = contents[0].content
+        assert '{"bids": [{"id": "B1"}]}' in text
+
+    @pytest.mark.anyio
+    async def test_order_history_resource(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        mock_client._client.request.return_value = _mock_response(200, {"bids": [{"id": "H1"}]})
+        contents = await mcp_app.read_resource("braiins://account/orders/history")
+        text = contents[0].content
+        assert '{"bids": [{"id": "H1"}]}' in text
+
+    @pytest.mark.anyio
     async def test_error_codes_resource(self, mcp_app: FastMCP) -> None:
         contents = await mcp_app.read_resource("braiins://docs/error-codes")
         text = contents[0].content
         assert "BraiinsValidationError" in text
         assert "BraiinsAuthError" in text
+
+
+class TestToolsErrors:
+    @pytest.mark.anyio
+    async def test_get_market_settings_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("timeout", status_code=504)
+        parsed = _parse_tool_response(await mcp_app.call_tool("get_market_settings", {}))
+        assert parsed.success is False
+        assert parsed.raw_api_status == 504
+
+    @pytest.mark.anyio
+    async def test_get_orderbook_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("rate limited", status_code=429)
+        parsed = _parse_tool_response(await mcp_app.call_tool("get_orderbook", {}))
+        assert parsed.success is False
+        assert parsed.raw_api_status == 429
+
+    @pytest.mark.anyio
+    async def test_list_orders_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("unauthorized", status_code=401)
+        parsed = _parse_tool_response(await mcp_app.call_tool("list_orders", {}))
+        assert parsed.success is False
+        assert parsed.raw_api_status == 401
+
+    @pytest.mark.anyio
+    async def test_create_bid_api_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError(
+            "insufficient funds", status_code=400
+        )
+        parsed = _parse_tool_response(
+            await mcp_app.call_tool(
+                "create_bid",
+                {
+                    "dest_upstream": "up1",
+                    "amount_sat": 1000,
+                    "price_sat": 50,
+                    "client_order_id": "err-1",
+                    "dry_run": False,
+                },
+            )
+        )
+        assert parsed.success is False
+        assert parsed.raw_api_status == 400
+
+    @pytest.mark.anyio
+    async def test_cancel_order_api_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("not found", status_code=404)
+        parsed = _parse_tool_response(
+            await mcp_app.call_tool(
+                "cancel_order", {"order_id": "B123", "dry_run": False}
+            )
+        )
+        assert parsed.success is False
+        assert parsed.raw_api_status == 404
+
+    @pytest.mark.anyio
+    async def test_cancel_order_dry_run(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        parsed = _parse_tool_response(
+            await mcp_app.call_tool(
+                "cancel_order", {"order_id": "B123", "dry_run": True}
+            )
+        )
+        assert parsed.success is True
+        assert parsed.data is not None
+        assert parsed.data.get("preview") is True
+
+    @pytest.mark.anyio
+    async def test_list_orders_filled_status(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        mock_client._client.request.return_value = _mock_response(200, {"bids": [{"id": "F1"}]})
+        parsed = _parse_tool_response(
+            await mcp_app.call_tool(
+                "list_orders", {"status": ["filled"], "limit": 10, "offset": 0}
+            )
+        )
+        assert parsed.success is True
+        assert parsed.data == {"bids": [{"id": "F1"}]}
+
+    @pytest.mark.anyio
+    async def test_create_bid_validation_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        parsed = _parse_tool_response(
+            await mcp_app.call_tool(
+                "create_bid",
+                {
+                    "dest_upstream": "up1",
+                    "amount_sat": 0,
+                    "price_sat": 50,
+                    "client_order_id": "err-val",
+                    "dry_run": False,
+                },
+            )
+        )
+        assert parsed.success is False
+        assert "amount" in (parsed.error or "").lower()
+    @pytest.mark.anyio
+    async def test_spot_settings_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("timeout", status_code=504)
+        contents = await mcp_app.read_resource("braiins://spot/settings")
+        text = contents[0].content
+        assert "error" in text
+        assert "504" in text
+
+    @pytest.mark.anyio
+    async def test_open_orders_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("timeout", status_code=504)
+        contents = await mcp_app.read_resource("braiins://account/orders/open")
+        text = contents[0].content
+        assert "error" in text
+
+    @pytest.mark.anyio
+    async def test_order_history_error(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        from braiins_hashpower_mcp.braiins.errors import BraiinsError
+        mock_client._client.request.side_effect = BraiinsError("timeout", status_code=504)
+        contents = await mcp_app.read_resource("braiins://account/orders/history")
+        text = contents[0].content
+        assert "error" in text
+
+    @pytest.mark.anyio
+    async def test_account_summary_not_implemented(
+        self, mcp_app: FastMCP, mock_client: BraiinsClient
+    ) -> None:
+        contents = await mcp_app.read_resource("braiins://account/summary")
+        text = contents[0].content
+        assert "not yet implemented" in text
 
 
 class TestPrompts:
