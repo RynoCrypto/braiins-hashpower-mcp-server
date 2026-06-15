@@ -1,7 +1,7 @@
 # SPEC.md — Braiins Hashpower MCP Server
 
 **Version:** 0.2  
-**Transport:** SSE (primary) + Streamable HTTP (v0.2)  
+**Transport:** SSE (primary) + Streamable HTTP (secondary)  
 **Framework:** FastMCP (`mcp[server]>=1.9.1`) + LangChain MCP Adapters  
 **API Target:** [Braiins Hashpower Network](https://hashpower.braiins.com/api/)  
 **Language:** Python 3.11+  
@@ -20,11 +20,13 @@ This document specifies the design of an MCP server that wraps the Braiins Hashp
 - Enforce server-side unit normalization using `/spot/settings` metadata before any order is submitted.
 - Support multi-tenant operation with full per-tenant credential and configuration isolation.
 - Scale horizontally with stateless compute nodes; all shared state in Redis and PostgreSQL.
-- Guarantee credentials never leave the server process.
+- Guarantee credentials never leave the server process and never appear in logs, traces, metrics labels, or error payloads.
 - Default to `dry_run=true` on all write tools until explicitly disabled by the operator.
+- Emit redacted OpenTelemetry traces and structured JSON audit logs for every tool invocation, including tenant ID, tool name, latency, upstream status, and outcome.
+- Fail closed on upstream instability and degrade to safe read-only behavior rather than silently retrying into unsafe duplicate writes.
 - Be compatible with `MultiServerMCPClient` from `langchain-mcp-adapters` over SSE.
 
-### Out of Scope (v0.2)
+### Out of Scope (current scope)
 
 - Futures or non-spot market types.
 - Webhook or push-based order status notifications.
@@ -41,7 +43,7 @@ The server uses SSE (Server-Sent Events) as its primary transport. SSE is one of
 - Runtime headers (e.g., `Authorization`, trace IDs) can be injected per-connection — a requirement for multi-tenant auth.
 - It is stateless-friendly for horizontally scaled deployments.
 
-`streamable_http` transport will be added as a secondary option in v0.2. The SSE endpoint is the v0.2 stable interface.
+`streamable_http` transport will be added as a secondary option. The SSE endpoint is the stable interface.
 
 ### Server Endpoint
 
@@ -104,11 +106,23 @@ Tenant-scoped behavior per request:
 
 ### 3.2 Single-Tenant Mode (development)
 
-Set `MCP_SINGLE_TENANT_MODE=true` and `SINGLE_TENANT_API_KEY=<key>` to bypass multi-tenant auth. This restores the single-process v0.1 behavior suitable for local development and direct Cursor/Claude Desktop integration.
+Set `MCP_SINGLE_TENANT_MODE=true` and `SINGLE_TENANT_API_KEY=<key>` to bypass multi-tenant auth. This restores the single-node development behavior suitable for local development and direct Cursor/Claude Desktop integration.
+
+### 3.3 Production Telemetry and Audit Boundary
+
+The worker is an enterprise service, so operational telemetry is part of the contract, not an afterthought.
+
+- Emit structured JSON logs only; never log raw secrets, HMAC material, full API payloads containing credentials, or unredacted tenant identifiers in free-form messages.
+- Correlate every request with `X-Trace-Id` and an internal request ID; propagate trace context to Braiins upstream calls.
+- Record per-tool metrics for success/error counts, latency P50/P95, retry count, circuit-breaker trips, cache hit ratio, idempotency hits, dry-run rate, and spend-cap rejections.
+- Export metrics and traces using OpenTelemetry; the default implementation stays provider-agnostic so the deployment target can ship to the current observability stack without code changes.
+- Redact before export: any wallet address, API key, secret, order payload field that can reveal tenant strategy, and any exception text that may have embedded credentials.
+- Keep audit events append-only in PostgreSQL (or the configured audit sink) with retention aligned to the enterprise policy for financial records.
+- The safe operational default for upstream outages is read-only degradation plus clear operator-facing errors; no hidden partial writes.
+- After redaction, telemetry from this worker is eligible to feed the TerraHash production learning/evaluation plane defined in the repository root.
 
 ---
 
-## 4. Server Implementation
 
 ### Framework
 
@@ -222,7 +236,7 @@ async def get_orderbook(
 **Input schema:**
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `market` | `"spot"` | `"spot"` | Market identifier (only spot in v0.2) |
+| `market` | `"spot"` | `"spot"` | Market identifier (spot only) |
 | `depth` | `int` | `20` | Number of levels to return per side |
 
 **Trust level:** Safe read  
@@ -528,6 +542,12 @@ def prompt_explain_units() -> str:
 | `MAX_CONNECTIONS_PER_NODE` | No | `500` | Max concurrent SSE connections per pod |
 | `LOG_LEVEL` | No | `INFO` | Python logging level |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | OpenTelemetry collector endpoint |
+| `OTEL_SERVICE_NAME` | No | `braiins-hashpower-mcp` | Service name for traces and metrics |
+| `AUDIT_LOG_RETENTION_DAYS` | No | `2555` | Append-only audit retention window |
+| `BRAIINS_API_TIMEOUT_SECONDS` | No | `15` | Upstream Braiins HTTP timeout |
+| `BRAIINS_MAX_RETRIES` | No | `3` | Retry attempts for transient upstream errors |
+| `SSE_KEEPALIVE_SECONDS` | No | `15` | SSE heartbeat interval |
+| `LOG_REDACTION_ENABLED` | No | `true` | Redact secrets and strategy-sensitive fields before logging |
 
 ### Single-Tenant / Development Mode
 
@@ -563,7 +583,7 @@ def prompt_explain_units() -> str:
 |------|-------|------|
 | Safe read | `get_market_settings`, `get_orderbook`, `list_orders`, `get_account_summary`, `get_deliveries` | No gate |
 | Sensitive write | `create_bid`, `cancel_order` | `tenant.mode=trading` + `dry_run` default |
-| Future: High-risk | Bulk cancel, ladder placement | Explicit `allow_bulk=true` tenant flag (v0.3) |
+| Future: High-risk | Bulk cancel, ladder placement | Explicit `allow_bulk=true` tenant flag for a later release |
 
 ### 9.2 Multi-Layer Safety Stack
 
@@ -710,41 +730,51 @@ dev = [
 | Unit: settings cache | pytest + fakeredis | TTL expiry, distributed lock, refresh |
 | Unit: idempotency | pytest + fakeredis | Dedup on second call, 24h TTL |
 | Unit: tenant loader | pytest + fakeredis + pytest-postgresql | Config cache hit/miss |
+| Unit: redaction | pytest | No secrets, wallet addresses, or strategy-sensitive fields in logs/traces/errors |
+| Contract: Braiins API | respx + recorded fixtures | Upstream endpoint shape, status mapping, retries |
 | Integration: SSE transport | pytest-asyncio + langchain-mcp-adapters | Full round-trip via `MultiServerMCPClient` |
 | Integration: multi-tenant | pytest-asyncio | Two tenants, isolated settings caches and creds |
 | Integration: dry_run | pytest-asyncio | `create_bid` with dry_run=true never hits Braiins API |
+| Integration: read-only fail-closed | pytest-asyncio | Upstream outage keeps writes blocked and read paths available |
+| Observability | pytest + caplog + OpenTelemetry test exporter | Trace IDs, metric emission, redacted payloads |
 | Load: SSE connections | locust | 500 concurrent SSE connections per node |
+| Chaos: upstream failures | pytest or integration harness | 5xx bursts trigger circuit breaker and safe degradation |
 
 ---
 
 ## 14. Versioning and Roadmap
 
-### v0.1 (initial spec)
+### Production Baseline
 - Single-tenant SSE transport
 - 7 tools (5 safe read, 2 sensitive write)
 - 5 resources
 - 3 prompts
 - `dry_run` default, `read_only` mode, spend cap
 
-### v0.2 (this spec)
+### Current Enterprise Scope
 - Multi-tenant support with per-tenant credential isolation
 - Stateless nodes with Redis shared state
 - PostgreSQL audit log and order mirror
 - API gateway + auth service integration
 - Idempotency via Redis
 - Prometheus metrics, structlog, OpenTelemetry tracing
+- Redacted audit events and no-secret logging guarantees
 - Circuit breaker for Braiins API
 - Health/ready endpoints for Kubernetes
 - `streamable_http` as secondary transport option
 - Docker Compose dev stack
+- Safe read-only degradation on upstream instability
+- Canary-first deploys with rollback on metric regression
 
-### v0.3 (planned)
+### Next Expansion
 - Hashrate DCA / ladder placement prompt
 - Portfolio exposure resource
 - ClickHouse integration for analytics-scale audit queries
 - Multi-account / sub-account support
 - Human-in-the-loop approval flow for live orders
 - Bulk cancel tool (high-risk tier, explicit opt-in)
+- Per-tenant budget policies and adaptive throttling
+- Enhanced audit export / retention controls
 
 ---
 
