@@ -1,180 +1,286 @@
 # Braiins Hashpower MCP Server — Development Plan
 
-## Project Overview
-
-Model Context Protocol (MCP) server exposing the Braiins Hashpower Market API. Provides LLM-accessible tools, resources, and prompts for managing Bitcoin hashpower bids and market data.
-
-**Repository**: `~/projects/braiins-hashpower-mcp-server/`
-**Language**: Python 3.13
-**Framework**: FastMCP + httpx
-**Transport**: SSE (Server-Sent Events)
+**Status:** THS alignment plan  
+**Last updated:** 2026-06-29  
+**Primary source:** `SPEC.md`  
+**Repository:** `/home/elvis/projects/RynoCrypto/braiins-hashpower-mcp-server`  
 
 ---
 
-## Architecture
+## 1. Project Goal
 
-```
-braiins_hashpower_mcp/
-├── __init__.py
-├── server.py              # FastMCP app, lifespan, health/ready handlers, main()
-├── braiins/
-│   ├── auth.py            # HMAC-less key header auth
-│   ├── client.py          # Async Braiins API client with tenacity retries
-│   ├── errors.py          # Exception hierarchy (auth, validation, rate-limit, server)
-│   ├── market.py          # Market data helpers (settings, orderbook, trades, fees, stats)
-│   ├── orders.py          # CRUD helpers for bids (create, edit, cancel, list)
-│   └── settings_cache.py  # TTL cache for spot settings
-├── mcp/
-│   ├── prompts.py         # MCP prompts (conservative bid, review orders, price units)
-│   ├── resources.py       # MCP resources (settings, open orders, history, error codes)
-│   ├── schemas.py         # Pydantic request/response models
-│   └── tools.py           # MCP tools (list_orders, create_bid, cancel_order, get_market_data)
-└── safety/
-    ├── __init__.py
-    ├── approvals.py       # Dry-run and read-only gating
-    ├── limits.py          # Bid amount/price ceiling checks
-    └── validators.py      # Input validation (upstream IDs, price ranges, idempotency)
-```
+Build and operate a THS-compliant MCP server for Braiins Hashpower market operations with strict schema contracts, tier-aware behavior, deterministic safety gates, structured errors, and production-grade deployment automation.
+
+Current baseline in the repository:
+- SSE-based MCP server
+- 6 core tools plus resources and prompts
+- dry-run-first write path
+- basic safety gates and structured responses
+- local development support
+
+This plan formalizes the remaining work needed to align the server with THS-PRD-MCP-001.
 
 ---
 
-## Development Phases
+## 2. Current Implementation Snapshot
 
-### Phase 1 — Foundation
-- [x] Project scaffolding (pyproject.toml, pytest, ruff, mypy)
-- [x] Braiins API client with retry/timeout logic
-- [x] Authentication module (API key headers)
-- [x] Exception hierarchy mapped to HTTP status codes
-- [x] Settings cache with TTL invalidation
+Implemented today:
+- `get_market_settings`
+- `get_orderbook`
+- `list_orders`
+- `get_deliveries` stubbed as a controlled failure path
+- `create_bid`
+- `cancel_order`
+- resources for spot settings, order lists, summary, and error codes
+- prompts for conservative bid placement, order review, and unit explanation
+- safety modules for approval, validation, spend limiting, and idempotency
 
-### Phase 2 — Business Logic
-- [x] Market data helpers (settings, orderbook, trades, fees, stats)
-- [x] Order lifecycle helpers (list, create, edit, cancel)
-- [x] Safety layer (validators, limits, approvals, idempotency)
-- [x] Error code documentation resource
-
-### Phase 3 — MCP Integration
-- [x] FastMCP server with SSE transport
-- [x] Tool definitions with Pydantic schemas
-- [x] Resource endpoints (spot settings, orders, history)
-- [x] Prompt templates for bid placement and review
-- [x] Health (`/health`) and readiness (`/ready`) probes
-
-### Phase 4 — Configuration & Deployment
-- [x] Environment-based configuration (API keys, base URL, host/port, mode)
-- [x] Docker support (Dockerfile, docker-compose)
-- [x] Makefile with common targets (install, test, lint, typecheck, run)
-- [x] README with setup and usage instructions
-
-### Phase 5 — Testing & Quality Assurance
-- [x] 5.1 Unit tests for auth.py — 100% branch coverage
-- [x] 5.2 Unit tests for client.py — retry, timeout, errors, mock server
-- [x] 5.3 Unit tests for safety layer — limits, validators, approvals, idempotency
-- [x] 5.4 Integration tests for tools (test_tools.py) — e2e with mocked Braiins
-- [x] 5.5 Integration tests for resources (test_resources.py) — cache warm/cold
-- [x] 5.6 Load test SSE endpoint — 100 concurrent connections (skippable if server offline)
-- [x] 5.7 Security audit — bandit + semgrep
-- [x] 5.8 Documentation review — README/SPEC/docstring accuracy
-- [x] 5.9 Full test suite, coverage report, lint, type checks
-
-**Coverage Result**: 99% (514 statements, 1 miss on `if __name__ == "__main__": main()`)
-**Test Count**: 193 passed, 2 skipped
-**Lint**: ruff clean
-**Type Check**: mypy clean (18 source files)
-**Security**: bandit clean (0 findings), semgrep clean (p/ci ruleset)
-
-### Phase 6 — CI/CD & Release Automation
-- [x] 6.1 GitHub Actions CI pipeline (lint, typecheck, test matrix 3.11–3.13, security scan)
-- [x] 6.2 GitHub Actions Release pipeline (build on tag, publish to PyPI via OIDC)
-- [x] 6.3 Coverage upload to Codecov
-- [x] 6.4 Artifact retention for security reports
-
-**CI Status**: `.github/workflows/ci.yml` — runs on push/PR to `main`
-**Release Status**: `.github/workflows/release.yml` — triggers on `v*` tags, trusted publishing to PyPI
+Current gaps vs. THS standard:
+- `x-ths-metadata` is not yet formalized on every tool
+- THS error envelope (`THS_ERR_*`) needs explicit contract normalization
+- Ansible deployment structure is not yet present in the repo
+- A2A agent card and discovery rollout are not yet implemented
+- observability and security gates need THS-specific documentation and coverage
 
 ---
 
-## Tool Inventory
+## 3. Delivery Phases
 
-| Tool | Action | Safety Gate |
-|------|--------|-------------|
-| `list_orders` | Read | — |
-| `create_bid` | Write | Validation → Limit → Approval → Dry-run optional |
-| `cancel_order` | Write | Validation → Approval → Dry-run optional |
-| `get_market_data` | Read | — |
+### Phase 0 — Contract Lock and THS Normalization
 
-## Resource Inventory
+**Objectives**
+- Lock the canonical tool/resource/prompt inventory.
+- Normalize error handling to the THS envelope.
+- Add required metadata contract for every tool.
+- Freeze scope, zones, roles, and gating behavior.
 
-| Resource | URI | Type |
-|----------|-----|------|
-| Spot Settings | `braiins://spot/settings` | Cached market config |
-| Open Orders | `braiins://account/orders/open` | Live list |
-| Order History | `braiins://account/orders/history` | Live list |
-| Error Codes | `braiins://docs/error-codes` | Static reference |
-| Account Summary | `braiins://account/summary` | Placeholder |
+**Deliverables**
+- Updated `SPEC.md` and supporting schema references
+- `x-ths-metadata` contract for all tools
+- `THS_ERR_*` error mapping and envelope examples
+- Tool-to-zone / tool-to-role matrix
+- Acceptance tests for schema and error normalization
 
-## Prompt Inventory
+**Quality gates**
+- Every tool definition includes `zone`, `is_mutating`, `requires_hitl`, `risk_level`, `scopes_required`, `permitted_agent_roles`, and `tool_schema_version`
+- Error responses use THS codes consistently
+- No write path bypasses dry-run or idempotency checks
 
-| Prompt | Purpose |
-|--------|---------|
-| `place_conservative_bid` | Guide user through low-risk bid placement |
-| `review_open_orders` | Summarize and suggest actions on open orders |
-| `explain_price_units` | Document sat/PH/day pricing model |
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SINGLE_TENANT_API_KEY` | — | Primary API key (also accepts `BRAIINS_API_KEY`) |
-| `BRAIINS_API_BASE_URL` | `https://api.braiins.com/v1` | Braiins API endpoint |
-| `BRAIINS_MODE` | `read_write` | `read_write` or `read_only` |
-| `BRAIINS_DRY_RUN_DEFAULT` | `True` | Default dry-run flag for write tools |
-| `MCP_SERVER_HOST` | `0.0.0.0` | SSE bind address |
-| `MCP_SERVER_PORT` | `8765` | SSE listen port |
+**Exit criteria**
+- Spec and implementation agree on tool contract shape
+- THS error format is documented and test-covered
+- No unresolved ambiguity remains around safety classification
 
 ---
 
-## Makefile Targets
+### Phase 1 — Core MCP Compliance
 
-```bash
-make install      # uv sync --all-extras
-make test         # pytest --cov=braiins_hashpower_mcp
-make lint         # ruff check .
-make typecheck    # mypy braiins_hashpower_mcp/
-make format       # ruff format .
-make run          # python -m braiins_hashpower_mcp.server
-make docker       # docker-compose up --build
-```
+**Objectives**
+- Make the MCP surface fully deterministic and THS-aligned.
+- Ensure read tools, resources, and prompts behave consistently.
+- Tighten request validation and response typing.
 
----
+**Deliverables**
+- Finalized read/write handlers
+- Strict schema validation for tool inputs and outputs
+- Resource serialization rules and freshness labels
+- Prompt workflows that only call bounded tools
+- Audit-friendly request IDs and log correlation
 
-## Security Hardening
+**Testing strategy**
+- Unit tests for validation, normalization, and safety gates
+- Integration tests for each tool with mocked upstream responses
+- Resource tests for cache hit/miss and stale behavior
+- Prompt tests for tool sequencing expectations
 
-1. **No secrets in logs** — `_sanitize_params` redacts `api_secret`, `password`, `token`.
-2. **Dry-run by default** — All write tools require explicit `dry_run=False` to mutate state.
-3. **Read-only mode** — `BRAIINS_MODE=read_only` blocks write tools at the gate.
-4. **Bid limits** — Ceiling checks prevent accidental oversized bids.
-5. **Idempotency cache** — 60-second deduplication window for identical write requests.
-6. **Tenacity retries** — Exponential backoff on network errors; no retry on 4xx.
-7. **Bandit clean** — B110 and B104 findings resolved or documented (`# nosec`).
+**Quality gates**
+- Read paths return deterministic envelopes
+- Write paths fail closed on missing validation
+- No prompt contains unbounded execution instructions
 
----
-
-## Next Steps / Future Work
-
-- OAuth 2.0 / multi-tenant auth (currently single API key)
-- Webhook push for order status changes
-- Historical P&L resource endpoint
-- Batch order operations (create multiple bids atomically)
-- Prometheus metrics export
+**Exit criteria**
+- All current tools pass contract tests
+- All resources validate against documented MIME/URI behavior
+- Prompts are documented and regression-tested
 
 ---
 
-## Changelog
+### Phase 2 — Performance, Reliability, and Observability
 
-| Date | Milestone |
-|------|-----------|
-| 2026-05-12 | Phase 5 complete — 99% test coverage, security audit passed, lint/type clean |
-| 2026-05-12 | Phase 6 complete — CI/CD pipelines (ci.yml + release.yml), PyPI trusted publishing configured |
+**Objectives**
+- Introduce the full cache architecture and observability stack.
+- Add upstream resilience controls.
+- Make the server production-operator friendly.
+
+**Deliverables**
+- L1 in-process cache + L2 Redis cache
+- Cache invalidation and stale-data policy
+- Circuit breaker and retry budgets for Braiins upstream calls
+- Prometheus metrics and OpenTelemetry tracing
+- Structured JSON logs with correlation IDs
+- Readiness and liveness checks aligned to runtime dependencies
+
+**Testing strategy**
+- Cache TTL and invalidation tests
+- Failure-mode tests for upstream outage and stale fallback
+- Metrics emission tests
+- Load tests for concurrent reads and write bursts
+- Logging assertions for secret redaction
+
+**Quality gates**
+- p99 latency targets are met for cached reads and dry-run writes
+- Cache hit ratio is measurable and stable
+- Observability emits required THS metrics and labels
+- Security-sensitive fields are redacted from logs
+
+**Exit criteria**
+- Operational dashboards and alerts exist
+- Read behavior degrades gracefully under upstream faults
+- Performance is repeatable across local and staging environments
+
+---
+
+### Phase 3 — Deployment, A2A, and Production Rollout
+
+**Objectives**
+- Add deployment automation and discovery registration.
+- Publish an Agent Card for A2A routing.
+- Enable production rollout with repeatable infrastructure.
+
+**Deliverables**
+- `ansible/` deployment structure at repo root
+- `agent-card.json` generation and validation
+- Discovery registration flow for A2A and MCP endpoints
+- Rollback and maintenance playbooks
+- Production rollout checklist and smoke tests
+
+**Testing strategy**
+- Ansible syntax and idempotency checks
+- Agent Card schema validation
+- Discovery endpoint health checks
+- Staged rollout smoke tests
+- Rollback drill validation
+
+**Quality gates**
+- Deployment is reproducible from Ansible
+- Agent Card is schema-valid and discoverable
+- Rollout does not bypass security or observability gates
+- Rollback can restore the last known good version
+
+**Exit criteria**
+- Production deployment is documented and automatable
+- Discovery endpoints and A2A metadata are live
+- Rollback and maintenance procedures are verified
+
+---
+
+## 4. Testing Strategy
+
+### 4.1 Unit Tests
+- Schema validation
+- Safety gating
+- Idempotency behavior
+- Error mapping and envelope construction
+- Unit normalization logic
+
+### 4.2 Integration Tests
+- MCP tool round-trips
+- Resource reads and cache behavior
+- Dry-run and live write flows
+- Upstream error propagation
+
+### 4.3 Security Tests
+- Secret redaction
+- Scope and role enforcement
+- HITL gating
+- Replay and duplicate request handling
+
+### 4.4 Operational Tests
+- Health/readiness probes
+- Metrics exposure
+- Alert rule presence
+- Deployment and rollback paths
+
+---
+
+## 5. CI/CD Pipeline
+
+### 5.1 Continuous Integration
+
+Pipeline stages:
+1. Format and lint
+2. Type / schema validation
+3. Unit tests
+4. Integration tests
+5. Security scans
+6. Packaging validation
+
+### 5.2 Continuous Delivery
+
+Pipeline stages:
+1. Build artifact
+2. Generate SBOM
+3. Produce deployment manifests
+4. Publish container image
+5. Run staging smoke tests
+6. Promote to production on approval
+
+### 5.3 Required Checks
+- `ruff` / formatting
+- `mypy` / type checking
+- test suite pass
+- secret scan pass
+- container vulnerability scan pass
+- schema / contract tests pass
+
+---
+
+## 6. Environment Variables
+
+### 6.1 Runtime Configuration
+
+| Variable | Purpose |
+|---|---|
+| `BRAIINS_API_KEY` | Braiins API key |
+| `BRAIINS_API_SECRET` | Braiins API secret |
+| `BRAIINS_API_BASE_URL` | Braiins API endpoint |
+| `BRAIINS_MODE` | `read_only` or `trading` |
+| `BRAIINS_DRY_RUN_DEFAULT` | Default dry-run behavior |
+| `MCP_SERVER_HOST` | Bind host |
+| `MCP_SERVER_PORT` | Bind port |
+| `REDIS_URL` | Redis cache / idempotency store |
+| `DATABASE_URL` | PostgreSQL audit store |
+| `LOG_LEVEL` | Logging level |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Trace export target |
+| `MCP_SINGLE_TENANT_MODE` | Development auth bypass |
+| `SINGLE_TENANT_API_KEY` | Local development key |
+
+### 6.2 Deployment Inputs
+- image tag
+- environment name
+- tenant config references
+- cache sizing parameters
+- alert routing targets
+
+---
+
+## 7. Deployment and Rollout Notes
+
+- Deploy via Ansible, not ad hoc shell scripts.
+- Verify discovery registration before marking deployment complete.
+- Keep read-only and mutating tool policies explicit in every environment.
+- Roll out first to staging, then production.
+- Always confirm health, metrics, and audit log writes after deployment.
+
+---
+
+## 8. Acceptance Summary
+
+The project is considered THS-aligned when:
+- tool contracts include full THS metadata
+- errors use `THS_ERR_*`
+- cache and observability policies are documented and implemented
+- Ansible deployment structure exists and is exercised
+- A2A Agent Card publication is available for discovery
+- CI/CD enforces quality and security gates
+- production rollout is reproducible and rollback-safe
